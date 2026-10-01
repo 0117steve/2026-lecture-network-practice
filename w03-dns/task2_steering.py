@@ -49,7 +49,10 @@ There is no fixed answer. You pass by producing, in out/report.md:
   - the steering number: "X of N sites answered differently to a different resolver"
   - at least one site where your classification rule was wrong, and why
 """
-import argparse, json, os, subprocess
+import argparse, json, os
+
+import dns.exception
+import dns.resolver
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "out")
@@ -76,23 +79,75 @@ RESOLVERS = {
 }
 
 
-def dig(name, rtype="A", server=None):
-    """Raw lookup. Transport only - the thinking is yours."""
-    args = ["dig", "+short", name, rtype]
-    if server:
-        args.insert(1, f"@{server}")
-    out = subprocess.run(args, capture_output=True, text=True).stdout
-    return [l.strip() for l in out.splitlines() if l.strip()]
+MAX_CNAME_HOPS = 30
+
+
+def make_resolver(server):
+    """Use the system DNS configuration or one specified DNS server."""
+    resolver = dns.resolver.Resolver(configure=server is None)
+    if server is not None:
+        resolver.nameservers = [server]
+    resolver.timeout = 2.0
+    resolver.lifetime = 5.0
+    return resolver
+
+
+def trace_cname_chain(name, resolver):
+    """Return ordered names from the original hostname through the last CNAME.
+
+    An absent CNAME ends the chain. Keep the partial chain and an error if a
+    lookup fails or the DNS data contains a loop.
+    """
+    chain = [name.rstrip(".").lower()]
+    seen = set(chain)
+    for _ in range(MAX_CNAME_HOPS):
+        try:
+            answer = resolver.resolve(chain[-1], "CNAME", raise_on_no_answer=False)
+        except (dns.exception.DNSException, OSError) as exc:
+            return chain, f"{type(exc).__name__}: {exc}"
+
+        if answer.rrset is None:
+            return chain, None
+        target = answer.rrset[0].target.to_text(omit_final_dot=True).lower()
+        chain.append(target)
+        if target in seen:
+            return chain, f"CNAME loop at {target}"
+        seen.add(target)
+
+    return chain, f"CNAME chain exceeded {MAX_CNAME_HOPS} hops"
+
+
+def lookup_addresses(name, resolver):
+    """Return the distinct IPv4 answers for the original site name."""
+    try:
+        answer = resolver.resolve(name, "A")
+    except (dns.exception.DNSException, OSError) as exc:
+        return [], f"{type(exc).__name__}: {exc}"
+    return sorted({record.address for record in answer}), None
 
 
 def collect():
-    """Gather raw chains and per-resolver answers into out/chains.json.
+    """Gather CNAME chains and each resolver's A set into out/chains.json."""
+    resolvers = {label: make_resolver(server)
+                 for label, server in RESOLVERS.items()}
+    results = {}
+    for site in SITES:
+        chain, chain_error = trace_cname_chain(site, resolvers["system"])
+        entry = {"cname_chain": chain, "addresses": {}, "errors": {}}
+        if chain_error:
+            entry["errors"]["cname_chain"] = chain_error
 
-    You write this. Roughly:
-      for each site: follow CNAMEs to the end, then for each resolver in
-      RESOLVERS record the A records it returns.
-    """
-    raise NotImplementedError("build the collector")
+        for label, resolver in resolvers.items():
+            addresses, error = lookup_addresses(site, resolver)
+            entry["addresses"][label] = addresses
+            if error:
+                entry["errors"][label] = error
+        results[site] = entry
+
+    os.makedirs(OUT, exist_ok=True)
+    with open(os.path.join(OUT, "chains.json"), "w", encoding="utf-8") as output:
+        json.dump(results, output, indent=2, ensure_ascii=False)
+        output.write("\n")
 
 
 def report():
