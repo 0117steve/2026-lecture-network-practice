@@ -67,26 +67,101 @@ class Sender:
     why in observation.md.
     """
 
+    # Selective Repeat (sliding window, §3.4.4) with a cumulative field.
+    #   packet on the wire : ("DATA", seq, payload)    seq = piece number
+    #   ACK on the wire    : ("ACK", seq, cumulative)  "I have seq, and every
+    #                                                   piece below cumulative"
+    WINDOW = 8        # pieces allowed to be unacknowledged at once
+    TIMEOUT = 10      # steps to wait for an ACK before sending a piece again
+
     def __init__(self, data_channel, ack_channel, data):
-        raise NotImplementedError("write your sender")
+        self.data_channel = data_channel
+        self.ack_channel = ack_channel
+        # R1: cut into PAYLOAD-sized pieces; the list index is the sequence number
+        self.pieces = [data[i:i + PAYLOAD] for i in range(0, len(data), PAYLOAD)]
+        self.base = 0             # oldest piece not yet acknowledged
+        self.next_seq = 0         # next piece never sent before
+        self.acked = set()
+        self.sent_at = {}         # seq -> step it was last (re)transmitted
+        self.clock = 0
 
     def step(self):
         """Do one unit of work. Return False when you believe you are done."""
-        raise NotImplementedError
+        self.clock += 1
+
+        # 1. Read every ACK that has arrived. Check the number on each one:
+        #    a duplicated or very late ACK names a piece we already counted,
+        #    and anything outside what we have sent is ignored.
+        while True:
+            ack = self.ack_channel.receive()
+            if ack is None:
+                break
+            kind, seq, cumulative = ack
+            if kind != "ACK":
+                continue
+            # The ACK names one piece *and* says "everything below `cumulative`
+            # has arrived". The second half means a lost ACK costs nothing as
+            # long as any later ACK gets through.
+            for s in [seq, *range(self.base, min(cumulative, self.next_seq))]:
+                if self.base <= s < self.next_seq and s not in self.acked:
+                    self.acked.add(s)
+                    self.sent_at.pop(s, None)
+        while self.base in self.acked:            # slide the window forward
+            self.acked.discard(self.base)
+            self.base += 1
+
+        if self.base >= len(self.pieces):
+            return False                          # every piece acknowledged
+
+        # 2. Send at most one packet per step.
+        #    R4: the oldest piece whose timer ran out goes first...
+        for seq in sorted(self.sent_at):
+            if self.clock - self.sent_at[seq] >= self.TIMEOUT:
+                self._transmit(seq)
+                return True
+        #    ...otherwise a new piece, if the window has room.
+        if self.next_seq < len(self.pieces) and self.next_seq < self.base + self.WINDOW:
+            self._transmit(self.next_seq)
+            self.next_seq += 1
+        return True
+
+    def _transmit(self, seq):
+        self.data_channel.send(("DATA", seq, self.pieces[seq]))
+        self.sent_at[seq] = self.clock
 
 
 class Receiver:
     """Your receiver. Hands back the reassembled bytes via `.data()`."""
 
     def __init__(self, data_channel, ack_channel):
-        raise NotImplementedError("write your receiver")
+        self.data_channel = data_channel
+        self.ack_channel = ack_channel
+        self.expected = 0         # next piece we can hand to the application
+        self.buffer = {}          # seq -> payload that arrived early
+        self.out = bytearray()
 
     def step(self):
-        raise NotImplementedError
+        packet = self.data_channel.receive()
+        if packet is None:
+            return
+        kind, seq, payload = packet
+        if kind != "DATA":
+            return
+        # R3: a piece we already delivered or already buffered is not written
+        #     twice - the copy is only acknowledged again.
+        if seq >= self.expected and seq not in self.buffer:
+            self.buffer[seq] = payload
+            # R2: hand pieces over strictly in order; early ones wait here.
+            while self.expected in self.buffer:
+                self.out += self.buffer.pop(self.expected)
+                self.expected += 1
+        # ACK every DATA we see, even an old duplicate: if a duplicate
+        # arrives, our earlier ACK may have been the thing that got lost.
+        self.ack_channel.send(("ACK", seq, self.expected))
 
     def data(self):
         """The bytes reassembled so far."""
-        raise NotImplementedError
+        return bytes(self.out)
 
 
 # ------------------------------------------------------------------- harness

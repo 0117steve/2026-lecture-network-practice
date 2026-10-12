@@ -53,12 +53,39 @@ class YourControl:
       That distinction has a name in the textbook.
     """
 
+    # Reno-style AIMD with three changes:
+    #
+    # 1. One cut per congestion event. Losses show up only as timeouts, so a
+    #    single overflow of the queue arrives as a burst of on_loss() calls,
+    #    one per dropped packet. Packets that were already in flight when we
+    #    cut cannot tell us anything new, so the next `window` events after a
+    #    cut are counted off without cutting again (the idea behind NewReno).
+    # 2. A gentler cut. Loss starts at about pipe + queue = 20 + 10 = 30
+    #    packets. Halving lands at 15, well under the 20 the pipe needs, and the
+    #    link sits idle. 0.6 x 30 = 18 lands just under the pipe instead.
+    # 3. Slow probing after that: +0.1 packet per round trip instead of +1, so
+    #    the window spends its time near the pipe size, not in the queue.
+    BETA = 0.6          # multiplicative decrease
+    INCREASE = 0.1      # additive increase, packets per round trip
+
     def __init__(self):
-        self.window = 1
-        raise NotImplementedError("write your congestion control")
+        self.window = 1.0
+        self.slow_start = True     # until the first loss: +1 per ACK (doubling)
+        self.recovery_left = 0     # events still owed to packets sent before the cut
 
     def on_ack(self):
-        raise NotImplementedError
+        if self.recovery_left:
+            self.recovery_left -= 1
+        if self.slow_start:
+            self.window += 1
+        else:
+            self.window += self.INCREASE / self.window   # ~INCREASE per RTT
 
     def on_loss(self):
-        raise NotImplementedError
+        if self.recovery_left:
+            # Same congestion event as the cut we already made.
+            self.recovery_left -= 1
+            return
+        self.slow_start = False
+        self.recovery_left = int(self.window)   # roughly what was in flight
+        self.window = max(2.0, self.window * self.BETA)
