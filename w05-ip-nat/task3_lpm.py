@@ -54,11 +54,23 @@ class YourTable:
     Say which you chose and what it cost you in memory.
     """
 
+    # Group by prefix length: one dict per length, network -> next hop.
+    # A lookup masks the address to each length present, longest first, and
+    # stops at the first dict that has it. That first hit is the longest match.
+
     def __init__(self):
-        raise NotImplementedError("write your table")
+        self.by_len = {}          # prefix_len -> {network: next_hop}
+        self.steps = ()           # (mask, dict.get) for each length, longest first
 
     def add(self, network, prefix_len, next_hop):
-        raise NotImplementedError
+        self.by_len.setdefault(prefix_len, {})[network] = next_hop
+        self.steps = tuple(
+            ((0xFFFFFFFF << (32 - plen)) & 0xFFFFFFFF, self.by_len[plen].get)
+            for plen in sorted(self.by_len, reverse=True))
 
     def lookup(self, address):
-        raise NotImplementedError
+        for mask, get in self.steps:
+            hop = get(address & mask)
+            if hop is not None:
+                return hop
+        return None
